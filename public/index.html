@@ -1435,12 +1435,18 @@ function renderConstituentSignal(analytics){
     sustainabilitySignalEl.className = `sustainability-signal ${currentBias === 'BULLISH' ? 'bullish' : currentBias === 'BEARISH' ? 'bearish' : 'neutral'}`;
   }
   if (qualityVerdictEl) {
-    const moveDir = move > 0 ? 'bullish' : move < 0 ? 'bearish' : 'neutral';
-    const sustainable = sustainabilityPct >= 50 && ((moveDir === 'bullish' && bullishSustainable >= bearishSustainable) || (moveDir === 'bearish' && bearishSustainable >= bullishSustainable) || moveDir === 'neutral');
-    const qualityNote = sustainable
-      ? `Weighted move is ${moveDir} and ${sustainabilityPct}% of constituents qualify, so this move is sustainable.`
-      : `Weighted move is ${moveDir}, but only ${sustainabilityPct}% qualify; this move is not sustainable.`;
-    qualityVerdictEl.textContent = qualityNote;
+    const sustainabilityStocks = analytics.allStocks || analytics.stocks || [];
+    const completedBuckets = sustainabilityStocks.reduce((maxBuckets, stock) => Math.max(maxBuckets, Number(stock.sustainabilityBuckets) || 0), 0);
+    const sustainabilityReady = sustainabilityStocks.some(stock => stock.sustainabilityReady);
+    if (!sustainabilityReady) {
+      qualityVerdictEl.textContent = `Historical data warming up: ${completedBuckets}/5 completed one-minute buckets.`;
+    } else {
+      const moveDir = move > 0 ? 'bullish' : move < 0 ? 'bearish' : 'neutral';
+      const sustainable = sustainabilityPct >= 50 && ((moveDir === 'bullish' && bullishSustainable >= bearishSustainable) || (moveDir === 'bearish' && bearishSustainable >= bullishSustainable) || moveDir === 'neutral');
+      qualityVerdictEl.textContent = sustainable
+        ? `Weighted move is ${moveDir} and ${sustainabilityPct}% of constituents qualify, so this move is sustainable.`
+        : `Weighted move is ${moveDir}, but only ${sustainabilityPct}% qualify; this move is not sustainable.`;
+    }
   }
   const moveEl = document.getElementById('weightedMove');
   moveEl.textContent = `${move >= 0 ? '+' : ''}${move.toFixed(3)}%`;
@@ -1450,14 +1456,17 @@ function renderConstituentSignal(analytics){
   document.getElementById('breadthDown').textContent = `${breadth.down || 0} / ${breadth.total || 0} · ${breadth.downPct || 0}%`;
   document.getElementById('breadthUpBar').style.width = `${breadth.upPct || 0}%`;
   document.getElementById('breadthDownBar').style.width = `${breadth.downPct || 0}%`;
-  document.getElementById('weightedQuality').textContent = `${sustainabilityPct}% of 50 constituents qualify at S ≥ 0.65${analytics.missing?.length ? ` · ${analytics.missing.length} unavailable` : ''}`;
+  const qualityStocks = analytics.allStocks || analytics.stocks || [];
+  const qualityReady = qualityStocks.some(stock => stock.sustainabilityReady);
+  const qualityBuckets = qualityStocks.reduce((maxBuckets, stock) => Math.max(maxBuckets, Number(stock.sustainabilityBuckets) || 0), 0);
+  document.getElementById('weightedQuality').textContent = `${qualityReady ? `${sustainabilityPct}% of 50 constituents qualify at S ≥ 0.65` : `Warming up: ${qualityBuckets}/5 completed one-minute buckets`}${analytics.missing?.length ? ` · ${analytics.missing.length} unavailable` : ''}`;
   document.getElementById('weightedCaptured').textContent = analytics.capturedAt ? `Updated ${new Date(analytics.capturedAt).toLocaleTimeString()} · ${analytics.sustainabilityStatus || 'MARKET STATUS'}` : 'Live constituent scan';
 
   const candidateStocks = (analytics.stocks && analytics.stocks.length ? analytics.stocks : analytics.allStocks || []).slice(0, 10);
   document.getElementById('constituentGrid').innerHTML = candidateStocks.length ? candidateStocks.map(stock => {
     const returnPct = Number(stock.dayReturnPct ?? stock.returnPct) || 0;
     const direction = returnPct > 0 ? 'up' : returnPct < 0 ? 'down' : 'flat';
-    const score = Number(stock.sustainabilityScore ?? 0).toFixed(3);
+    const score = stock.sustainabilityReady === false ? 'WARMING UP' : Number(stock.sustainabilityScore ?? 0).toFixed(3);
     return `<div class="constituent-row">
       <span class="constituent-name">${stock.ticker}<span class="constituent-meta">Weight ${Number(stock.weight).toFixed(2)}% · S ${score}</span></span>
       <span class="constituent-price">₹${Number(stock.price).toFixed(2)}</span>
@@ -1579,6 +1588,17 @@ function renderStrikes(options, strikeTotals, atm, openingOptions=[]){
 //  RENDER SIGNALS
 // ============================================================
 function renderSignals(options){
+  if(!options.length){
+    document.getElementById('countLong').textContent='0 Active';
+    document.getElementById('countShort').textContent='0 Active';
+    document.getElementById('countWait').textContent='0 Active';
+    document.getElementById('cardLong').classList.remove('active');
+    document.getElementById('cardShort').classList.remove('active');
+    document.getElementById('cardWait').classList.remove('active');
+    document.getElementById('signalExplanation').innerHTML='<span class="hl">// OPTION DATA UNAVAILABLE</span><br>Waiting for a valid quote response.';
+    return {topSig:null,topOpt:null};
+  }
+
   let longs=0,shorts=0,waits=0,topSig=null,topOpt=null;
   options.forEach(opt=>{
     const s=getSignal(opt);
