@@ -56,10 +56,16 @@ const NIFTY_WEIGHTS = {
   TECHM: 0.88, TITAN: 1.57, TMPV: 0.74, TRENT: 0.85,
   ULTRACEMCO: 1.21, WIPRO: 0.48,
 };
+let niftyWeightsRefreshDate = null;
 
 const STRONG_WEIGHTED_MOVE = 0.50;
 const MILD_WEIGHTED_MOVE = 0.10;
 const STOCK_DIRECTION_HISTORY = new Map();
+const STOCK_BUCKET_HISTORY = new Map();
+const SUSTAINABILITY_BUCKET_COUNT = 5;
+const SUSTAINABILITY_HISTORY_LIMIT = 10;
+const MARKET_MINUTES_PER_DAY = 375;
+let ACTIVE_SUSTAINABILITY_BUCKET = null;
 
 let MARKET_PULSE = {
   date: null,
@@ -451,11 +457,21 @@ function findOption(strike, type) {
       x.symbol.endsWith(type)
   );
 
-  const expiries = [
-    ...new Set(items.map(x => x.expiry))
-  ].sort((a, b) => new Date(a) - new Date(b));
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const monthIndexes = { JAN: 0, FEB: 1, MAR: 2, APR: 3, MAY: 4, JUN: 5, JUL: 6, AUG: 7, SEP: 8, OCT: 9, NOV: 10, DEC: 11 };
+  const parseExpiry = expiry => {
+    const match = String(expiry).match(/^(\d{2})([A-Z]{3})(\d{4})$/);
+    if (!match || monthIndexes[match[2]] === undefined) return null;
+    return new Date(Number(match[3]), monthIndexes[match[2]], Number(match[1]));
+  };
+  const expiries = [...new Set(items.map(x => x.expiry))]
+    .map(expiry => ({ expiry, date: parseExpiry(expiry) }))
+    .filter(item => item.date && item.date >= today)
+    .sort((a, b) => a.date - b.date);
 
-  const nearestExpiry = expiries[0];
+  const nearestExpiry = expiries[0]?.expiry;
+  if (!nearestExpiry) return undefined;
 
   return items.find(
     x =>
@@ -689,15 +705,6 @@ function sumDepthQty(entries) {
   return entries.reduce((sum, item) => sum + (Number(item?.quantity) || Number(item?.qty) || 0), 0);
 }
 
-function computeDirectionPersistence(ticker, directionValue, lookback = 5) {
-  const directionHistory = STOCK_DIRECTION_HISTORY.get(ticker) || [];
-  const nextHistory = [...directionHistory, directionValue].slice(-lookback);
-  STOCK_DIRECTION_HISTORY.set(ticker, nextHistory);
-  if (!nextHistory.length) return 0;
-  const sameDirection = nextHistory.filter(value => value === directionValue).length;
-  return Number((sameDirection / nextHistory.length).toFixed(3));
-}
-
 function getOrderFlowStrength(directionValue, bidQty, askQty) {
   const normalizedBid = Number(bidQty) || 0;
   const normalizedAsk = Number(askQty) || 0;
@@ -720,15 +727,126 @@ function getVolumeConfirmation(currentVolume, avgVolume) {
   return Math.min(volume / averageVolume, 1);
 }
 
+function getDirectionalOrderFlowSupport(directionValue, bidQty, askQty) {
+  const bid = Number(bidQty) || 0;
+  const ask = Number(askQty) || 0;
+  const total = bid + ask;
+  if (!total || directionValue === 0) return 0.5;
+  return directionValue > 0 ? bid / total : ask / total;
+}
+
+function getBucketDirection(priceReturn) {
+  return priceReturn > 0 ? 1 : priceReturn < 0 ? -1 : 0;
+}
+
+function getIndiaMinuteBucketKey() {
+  const { date, time } = indiaDateTime();
+  return `${date}T${time.slice(0, 5)}`;
+}
+
+function finalizeSustainabilityBucket(bucket) {
+  for (const [ticker, sample] of bucket.stocks.entries()) {
+    const latest = sample.latest;
+    if (!latest?.price || !sample.firstPrice) continue;
+
+    const priceReturn = ((latest.price - sample.firstPrice) / sample.firstPrice) * 100;
+    const direction = getBucketDirection(priceReturn);
+    const volumeDelta = latest.volume >= sample.firstVolume
+      ? latest.volume - sample.firstVolume
+      : latest.volume;
+    const history = STOCK_BUCKET_HISTORY.get(ticker) || [];
+    history.push({
+      timestamp: bucket.key,
+      price: latest.price,
+      returnPct: Number(priceReturn.toFixed(4)),
+      bidQty: latest.bidQty,
+      askQty: latest.askQty,
+      orderFlow: getDirectionalOrderFlowSupport(direction, latest.bidQty, latest.askQty),
+      volume: Math.max(0, volumeDelta),
+      avgVolume: latest.avgVolume,
+      breadth: bucket.breadth,
+      direction,
+      gapPct: latest.gapPct,
+    });
+    STOCK_BUCKET_HISTORY.set(ticker, history.slice(-SUSTAINABILITY_HISTORY_LIMIT));
+  }
+}
+
+function recordSustainabilityBucket(stocks, breadth) {
+  const bucketKey = getIndiaMinuteBucketKey();
+  const bucketDate = bucketKey.slice(0, 10);
+  if (ACTIVE_SUSTAINABILITY_BUCKET && ACTIVE_SUSTAINABILITY_BUCKET.key.slice(0, 10) !== bucketDate) {
+    STOCK_BUCKET_HISTORY.clear();
+    ACTIVE_SUSTAINABILITY_BUCKET = null;
+  }
+  if (ACTIVE_SUSTAINABILITY_BUCKET && ACTIVE_SUSTAINABILITY_BUCKET.key !== bucketKey) {
+    finalizeSustainabilityBucket(ACTIVE_SUSTAINABILITY_BUCKET);
+    ACTIVE_SUSTAINABILITY_BUCKET = null;
+  }
+  if (!ACTIVE_SUSTAINABILITY_BUCKET) {
+    ACTIVE_SUSTAINABILITY_BUCKET = { key: bucketKey, stocks: new Map(), breadth };
+  }
+  ACTIVE_SUSTAINABILITY_BUCKET.breadth = breadth;
+
+  for (const stock of stocks) {
+    const existing = ACTIVE_SUSTAINABILITY_BUCKET.stocks.get(stock.ticker);
+    if (!existing) {
+      ACTIVE_SUSTAINABILITY_BUCKET.stocks.set(stock.ticker, {
+        firstPrice: stock.price,
+        firstVolume: stock.volume,
+        latest: stock,
+      });
+    } else {
+      existing.latest = stock;
+    }
+  }
+}
+
 function computeSustainabilityScore(stock, breadth) {
   const returnPct = Number(stock.returnPct ?? stock.dayReturnPct ?? 0) || 0;
   const directionValue = returnPct > 0 ? 1 : returnPct < 0 ? -1 : 0;
-  const directionPersistence = computeDirectionPersistence(stock.ticker, directionValue, 5);
-  const orderFlowStrength = getOrderFlowStrength(directionValue, stock.bidQty, stock.askQty);
-  const volumeConfirmation = getVolumeConfirmation(stock.volume, stock.avgVolume);
-  const breadthPct = directionValue > 0 ? (Number(breadth.upPct) || 0) / 100 : directionValue < 0 ? (Number(breadth.downPct) || 0) / 100 : 0;
-  const gapPct = Number(stock.gapPct) || 0;
-  const gapAlignment = (gapPct > 0 && returnPct > 0) || (gapPct < 0 && returnPct < 0) ? 1 : 0;
+  const history = STOCK_BUCKET_HISTORY.get(stock.ticker) || [];
+  if (history.length < SUSTAINABILITY_BUCKET_COUNT) {
+    return {
+      directionPersistence: null,
+      orderFlowStrength: null,
+      volumeConfirmation: null,
+      breadthAlignment: null,
+      gapAlignment: null,
+      sustainabilityScore: null,
+      sustainabilityReady: false,
+      sustainabilityBuckets: history.length,
+      sustainableBias: 'WARMING UP',
+    };
+  }
+
+  const buckets = history.slice(-SUSTAINABILITY_BUCKET_COUNT);
+  const directionPersistence = buckets.filter(bucket => bucket.direction === directionValue).length / buckets.length;
+  const orderFlowStrength = buckets.reduce((sum, bucket) => {
+    const support = getDirectionalOrderFlowSupport(directionValue, bucket.bidQty, bucket.askQty);
+    return sum + (bucket.direction === directionValue ? support : support * 0.5);
+  }, 0) / buckets.length;
+  const fallbackMinuteVolume = buckets.reduce((sum, bucket) => sum + bucket.volume, 0) / buckets.length;
+  const minuteAverageVolume = Number(stock.avgVolume) > 0
+    ? Number(stock.avgVolume) / MARKET_MINUTES_PER_DAY
+    : fallbackMinuteVolume;
+  const volumeConfirmation = minuteAverageVolume > 0
+    ? buckets.reduce((sum, bucket) => {
+      const strength = Math.min(bucket.volume / minuteAverageVolume, 1);
+      return sum + (bucket.direction === directionValue ? strength : strength * 0.5);
+    }, 0) / buckets.length
+    : 0;
+  const breadthValues = buckets.map(bucket => directionValue > 0
+    ? Number(bucket.breadth.weightedUpPct || bucket.breadth.upPct || 0) / 100
+    : directionValue < 0
+      ? Number(bucket.breadth.weightedDownPct || bucket.breadth.downPct || 0) / 100
+      : 0.5);
+  const breadthPct = breadthValues.reduce((sum, value) => sum + value, 0) / breadthValues.length;
+  const gapAlignment = buckets.reduce((sum, bucket) => {
+    const gap = Number(bucket.gapPct) || 0;
+    if (!gap || !directionValue) return sum + 0.5;
+    return sum + ((gap > 0 && directionValue > 0) || (gap < 0 && directionValue < 0) ? 1 : 0);
+  }, 0) / buckets.length;
   const sustainabilityScore = 0.30 * directionPersistence + 0.25 * orderFlowStrength + 0.20 * volumeConfirmation + 0.15 * breadthPct + 0.10 * gapAlignment;
   const sustainableBias = sustainabilityScore >= 0.65
     ? (returnPct > 0 ? 'SUSTAINABLE BULLISH' : returnPct < 0 ? 'SUSTAINABLE BEARISH' : 'WEAK / NOISE')
@@ -739,13 +857,55 @@ function computeSustainabilityScore(stock, breadth) {
     orderFlowStrength: Number(orderFlowStrength.toFixed(3)),
     volumeConfirmation: Number(volumeConfirmation.toFixed(3)),
     breadthAlignment: Number(Math.min(Math.max(breadthPct, 0), 1).toFixed(3)),
-    gapAlignment,
+    gapAlignment: Number(gapAlignment.toFixed(3)),
     sustainabilityScore: Number(sustainabilityScore.toFixed(3)),
+    sustainabilityReady: true,
+    sustainabilityBuckets: buckets.length,
     sustainableBias,
   };
 }
 
+async function refreshNiftyWeights() {
+  const { date } = indiaDateTime();
+  if (niftyWeightsRefreshDate === date) return;
+
+  try {
+    const response = await axios.get(
+      'https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050',
+      {
+        timeout: 10000,
+        headers: {
+          'User-Agent': 'Mozilla/5.0',
+          Accept: 'application/json,text/plain,*/*',
+          Referer: 'https://www.nseindia.com/',
+        },
+      }
+    );
+    const nextWeights = {};
+    for (const row of response.data?.data || []) {
+      const ticker = String(row.symbol || '').trim();
+      const weight = Number(row.weightage ?? row.weight);
+      if (ticker && Number.isFinite(weight) && weight > 0 && ticker !== 'NIFTY 50') {
+        nextWeights[ticker] = weight;
+      }
+    }
+
+    if (Object.keys(nextWeights).length < 40) {
+      throw new Error('NSE returned an incomplete NIFTY 50 weight list');
+    }
+
+    Object.keys(NIFTY_WEIGHTS).forEach(ticker => delete NIFTY_WEIGHTS[ticker]);
+    Object.assign(NIFTY_WEIGHTS, nextWeights);
+    console.log(`NIFTY weights refreshed from NSE: ${Object.keys(nextWeights).length} constituents`);
+  } catch (error) {
+    console.warn('NIFTY weight refresh unavailable; using configured weights:', error.message);
+  } finally {
+    niftyWeightsRefreshDate = date;
+  }
+}
+
 async function fetchNiftyConstituents() {
+  await refreshNiftyWeights();
   const tokenMap = {};
   const missing = [];
   Object.entries(NIFTY_WEIGHTS).forEach(([ticker, weight]) => {
@@ -813,6 +973,12 @@ async function fetchNiftyConstituents() {
     downPct: rawStocks.length ? Number((down / rawStocks.length * 100).toFixed(1)) : 0,
     unchangedPct: rawStocks.length ? Number((unchanged / rawStocks.length * 100).toFixed(1)) : 0,
   };
+  const totalWeight = rawStocks.reduce((sum, stock) => sum + (Number(stock.weight) || 0), 0);
+  const bullishWeight = rawStocks.filter(stock => stock.returnPct > 0).reduce((sum, stock) => sum + stock.weight, 0);
+  const bearishWeight = rawStocks.filter(stock => stock.returnPct < 0).reduce((sum, stock) => sum + stock.weight, 0);
+  breadth.weightedUpPct = totalWeight ? Number((bullishWeight / totalWeight * 100).toFixed(1)) : 0;
+  breadth.weightedDownPct = totalWeight ? Number((bearishWeight / totalWeight * 100).toFixed(1)) : 0;
+  breadth.weightedTotalWeight = Number(totalWeight.toFixed(3));
   const gapBreadth = {
     up: gapUp,
     down: gapDown,
@@ -822,6 +988,7 @@ async function fetchNiftyConstituents() {
     unchangedPct: rawStocks.length ? Number((gapFlat / rawStocks.length * 100).toFixed(1)) : 0,
   };
 
+  recordSustainabilityBucket(rawStocks, breadth);
   const stocksWithSustainability = rawStocks.map(stock => ({
     ...stock,
     ...computeSustainabilityScore(stock, breadth),
@@ -847,7 +1014,7 @@ async function fetchNiftyConstituents() {
 
   return {
     stocks: sustainableStocks,
-    allStocks: rawStocks.sort((a, b) => b.weight - a.weight),
+    allStocks: stocksWithSustainability.sort((a, b) => b.weight - a.weight),
     sustainableCount: sustainableStocks.length,
     sustainablePct,
     weakStocks,
